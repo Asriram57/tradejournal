@@ -31,3 +31,8 @@ TeraBox has no public browser API (no CORS, no OAuth for web apps), so direct sy
 ## One-click Google sign-in (no keys for your users)
 The site owner registers **one** Google OAuth Client ID once (put it in `config.js`). After that, every visitor just clicks **Sign in with Google** in the header, picks their account, and their data is saved in **their own** Drive in a `Trade Pulse Pro` folder: the data file plus each chart screenshot as a separate image file. Key boxes are hidden whenever `config.js` has a key. The `drive.file` scope is non-sensitive, so no Google app verification is needed; just publish the consent screen.
 Run `python3 patch_google_first.py` after `patch_sync.py` to enable this.
+
+## Several devices at once
+You can stay signed in on any number of devices. Signing in on a new device never signs out the others. Changes merge per trade / journal entry / account (no device overwrites another), deletions sync, and every open tab refreshes itself every minute and when you switch back to it.
+Google access tokens last about 1 hour. The app renews them automatically; if the browser blocks that, the header button shows **Tap to reconnect**. One tap restores sync and nothing is lost.
+Run `python3 apply_all.py` to apply every upgrade (`patch_sync`, `patch_google_first`, `patch_image_hydrate`, `patch_multidevice`).

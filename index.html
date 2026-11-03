@@ -1297,6 +1297,7 @@ function loadAll(){
   applyI18n();
   window.__tpReady = true;
   refreshAll();
+  if(!localStorage.getItem(SNAP_KEY)) stamp(false);
   oaFinish().then(p=>{ if(p){ syncProvider=p; localStorage.setItem('tp_sync_provider',p); } initSync(); });
   initMantras();
 }
@@ -1441,8 +1442,9 @@ const Providers = {
         client_id: GOOGLE_CLIENT_ID,
         scope: 'https://www.googleapis.com/auth/drive.file',
         callback: resp=>{
-          if(resp.error){ console.warn('Drive auth error', resp); setSyncStatus(syncConnected?'error':'off'); return; }
-          driveAccessToken = resp.access_token;
+          if(resp.error){ console.warn('Drive auth error', resp); if(window.__gRefresh){ const f=window.__gRefresh; window.__gRefresh=null; f(false); return; } setSyncStatus(syncConnected?'error':'off'); return; }
+          driveAccessToken = resp.access_token; try{ localStorage.setItem('tp_gtok', JSON.stringify({t:driveAccessToken, exp:Date.now()+((resp.expires_in||3600)-120)*1000})); }catch(e){}
+          if(window.__gRefresh){ const f=window.__gRefresh; window.__gRefresh=null; f(true); return; }
           localStorage.setItem('tp_was_connected_gdrive','1');
           onConnected();
         }
@@ -1454,7 +1456,7 @@ const Providers = {
       if(!this.setup()){ alert('Google sign-in is still loading — try again in a second.'); return; }
       driveTokenClient.requestAccessToken({prompt:'select_account'});
     },
-    disconnect(){ driveAccessToken = null; ['tp_was_connected_gdrive','tp_drive_folder','tp_drive_file_id'].forEach(k=>localStorage.removeItem(k)); },
+    disconnect(){ driveAccessToken = null; ['tp_was_connected_gdrive','tp_drive_folder','tp_drive_file_id','tp_gtok'].forEach(k=>localStorage.removeItem(k)); },
     async find(){
       const q = encodeURIComponent(`name='${SYNC_FILE}' and trashed=false`);
       const res = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&spaces=drive&fields=files(id,name)`, {headers:{Authorization:'Bearer '+driveAccessToken}});
@@ -1626,6 +1628,7 @@ async function driveImgGet(id){
 (function(){
   const g = Providers.gdrive, op = g.push.bind(g), ol = g.pull.bind(g);
   g.push = async function(payload){
+    await ensureGToken();
     const out = [];
     for(const t of payload.trades){
       const c = Object.assign({}, t);
@@ -1641,6 +1644,7 @@ async function driveImgGet(id){
     return op(Object.assign({}, payload, {trades: out}));
   };
   g.pull = async function(){
+    await ensureGToken();
     const r = await ol(); if(!r) return r;
     const need = [];
     for(const t of (r.trades||[])){
@@ -1655,6 +1659,104 @@ async function driveImgGet(id){
   };
 })();
 
+async function hydrateImages(){
+  if(syncProvider!=='gdrive' || !syncConnected || !driveAccessToken) return;
+  const need = trades.filter(t=>t.imageId && !t.image);
+  if(!need.length) return;
+  let got = 0;
+  for(let i=0; i<need.length; i+=4){
+    await Promise.all(need.slice(i,i+4).map(async t=>{
+      try{
+        const d = await driveImgGet(t.imageId);
+        if(d){ t.image = d; got++; } else console.warn('Drive image not found/denied:', t.imageId);
+      }catch(e){ console.warn('Drive image download failed', e); }
+    }));
+  }
+  if(got){ try{ localStorage.setItem(TRADES_KEY, JSON.stringify(trades)); }catch(e){} refreshAll(); }
+}
+
+/* ---- multi-device: record-level merge, tombstones, auto refresh ---- */
+const SNAP_KEY = 'tp_snap', TOMB_KEY = 'tp_tomb';
+let syncDirty = false, needReauth = false, lastRemoteTs = 0;
+const _jp = (k,d)=>{ try{ return JSON.parse(localStorage.getItem(k)||'null') || d; }catch(e){ return d; } };
+function _sig(x){
+  const str = JSON.stringify(x, (k,v)=> k==='_u' ? undefined : (k==='image' && typeof v==='string' ? v.length : v));
+  let h = 5381; for(let i=0;i<str.length;i++) h = ((h<<5)+h+str.charCodeAt(i))|0; return h;
+}
+function persistAll(){
+  try{ localStorage.setItem(TRADES_KEY, JSON.stringify(trades)); localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts)); localStorage.setItem(JOURNAL_KEY, JSON.stringify(journalEntries)); }catch(e){}
+}
+function stamp(doStamp){
+  const snap = _jp(SNAP_KEY,{}), tomb = _jp(TOMB_KEY,{}), now = Date.now(), cur = {}; let changed = false;
+  [['t',trades],['a',accounts],['j',journalEntries]].forEach(([p,arr])=>arr.forEach(x=>{
+    const key = p+':'+x.id, sg = _sig(x); cur[key] = sg;
+    if(doStamp && snap[key]!==sg){ x._u = now; changed = true; }
+    if(tomb[key] && tomb[key] < (x._u||0)) delete tomb[key];
+  }));
+  if(doStamp) for(const k in snap) if(!(k in cur) && !tomb[k]){ tomb[k] = now; changed = true; }
+  localStorage.setItem(SNAP_KEY, JSON.stringify(cur)); localStorage.setItem(TOMB_KEY, JSON.stringify(tomb));
+  return changed;
+}
+function mergeLists(p, local, remote, tomb){
+  const m = new Map(); (remote||[]).forEach(x=>m.set(x.id,x));
+  (local||[]).forEach(x=>{ const o = m.get(x.id); if(!o || (x._u||0) >= (o._u||0)) m.set(x.id,x); });
+  return Array.from(m.values()).filter(x=>{ const d = tomb[p+':'+x.id]; return !(d && d > (x._u||0)); });
+}
+function newerThan(arr, other){
+  const o = new Map((other||[]).map(x=>[x.id,x]));
+  return arr.some(x=>{ const r = o.get(x.id); return !r || (x._u||0) > (r._u||0); });
+}
+async function ensureGToken(){
+  const o = _jp('tp_gtok', null);
+  if(o && Date.now() < o.exp){ driveAccessToken = o.t; return; }
+  const ok = await new Promise(res=>{
+    window.__gRefresh = res;
+    setTimeout(()=>{ if(window.__gRefresh===res){ window.__gRefresh = null; res(false); } }, 20000);
+    try{ if(!Providers.gdrive.setup()) throw 0; driveTokenClient.requestAccessToken({prompt:''}); }catch(e){ window.__gRefresh = null; res(false); }
+  });
+  if(!ok) throw new Error('reauth');
+}
+async function syncAll(force, auto){
+  if(!syncConnected || syncBusy) return;
+  if(auto && needReauth) return;
+  syncBusy = true; setSyncStatus('syncing');
+  try{
+    if(stamp(true)) persistAll();
+    const prov = Providers[syncProvider];
+    const remote = await prov.pull();
+    let needPush = !!force || syncDirty || !remote, changedLocal = false;
+    if(remote){
+      const tomb = Object.assign({}, remote.tombstones||{}), lt = _jp(TOMB_KEY,{});
+      for(const k in lt) tomb[k] = Math.max(tomb[k]||0, lt[k]);
+      const old = new Map(trades.map(t=>[t.id,t]));
+      const mt = mergeLists('t', trades, remote.trades, tomb), ma = mergeLists('a', accounts, remote.accounts, tomb), mj = mergeLists('j', journalEntries, remote.journalEntries, tomb);
+      mt.forEach(t=>{ if(t.imageId && !t.image){ const o = old.get(t.id); if(o && o.image && o.imageId===t.imageId) t.image = o.image; } });
+      needPush = needPush || newerThan(mt,remote.trades) || newerThan(ma,remote.accounts) || newerThan(mj,remote.journalEntries) || Object.keys(tomb).length > Object.keys(remote.tombstones||{}).length;
+      changedLocal = (remote.updatedAt||0) !== lastRemoteTs;
+      trades = mt; accounts = ma.length ? ma : [{id:'default', name:'Main Account'}]; journalEntries = mj;
+      if((remote.updatedAt||0) > (parseInt(localStorage.getItem('tp_local_updated_at')||'0',10)) && remote.settings){ settings = Object.assign(settings, remote.settings); delete settings.theme; }
+      localStorage.setItem(TOMB_KEY, JSON.stringify(tomb));
+      saveTrades(true); saveAccounts(true); saveJournal(true); saveSettings(true);
+      stamp(false); lastRemoteTs = remote.updatedAt||0;
+    }
+    if(needPush){
+      const payload = {trades, accounts, settings, journalEntries, tombstones:_jp(TOMB_KEY,{}), updatedAt:Date.now()};
+      await prov.push(payload);
+      localStorage.setItem('tp_local_updated_at', String(payload.updatedAt));
+      lastRemoteTs = payload.updatedAt; syncDirty = false; stamp(false);
+    }
+    if(changedLocal){ renderAccountSelect(); refreshAll(); }
+    needReauth = false; syncBusy = false; setSyncStatus('connected');
+    hydrateImages();
+  }catch(e){
+    syncBusy = false;
+    if(e && e.message==='reauth'){ needReauth = true; setSyncStatus('error'); const b = document.getElementById('syncBtnText'); if(b) b.textContent = 'Tap to reconnect'; return; }
+    handleSyncError(e);
+  }
+}
+setInterval(()=>{ if(document.visibilityState==='visible') syncAll(false,true); }, 60000);
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') syncAll(false,true); });
+
 function onConnected(){
   syncConnected = true;
   localStorage.setItem('tp_sync_provider', syncProvider);
@@ -1666,7 +1768,9 @@ function initSync(){
   refreshSyncUI();
   setSyncStatus('off');
   if(syncProvider==='gdrive'){
-    if(localStorage.getItem('tp_was_connected_gdrive')==='1' && GOOGLE_CLIENT_ID){
+    const _o = (()=>{ try{ return JSON.parse(localStorage.getItem('tp_gtok')||'null'); }catch(e){ return null; } })();
+    if(_o && Date.now()<_o.exp && localStorage.getItem('tp_was_connected_gdrive')==='1'){ driveAccessToken=_o.t; onConnected(); }
+    else if(localStorage.getItem('tp_was_connected_gdrive')==='1' && GOOGLE_CLIENT_ID){
       let tries = 0;
       const iv = setInterval(()=>{
         tries++;
@@ -1714,28 +1818,8 @@ async function mergeRemoteData(remote){
   if(r > l) applyRemote(remote, r);
   else if(l > r) await syncPush();
 }
-async function syncPull(){
-  if(!syncConnected || syncBusy) return;
-  syncBusy = true; setSyncStatus('syncing');
-  try{
-    const remote = await Providers[syncProvider].pull();
-    syncBusy = false;
-    if(remote) await mergeRemoteData(remote); else await syncPush();
-    setSyncStatus('connected');
-  }catch(e){ syncBusy = false; handleSyncError(e); }
-}
-async function syncPush(){
-  if(!syncConnected || syncBusy) return;
-  syncBusy = true; setSyncStatus('syncing');
-  const payload = {trades, accounts, settings, journalEntries, updatedAt: Date.now()};
-  try{
-    await Providers[syncProvider].push(payload);
-    localStorage.setItem('tp_local_updated_at', String(payload.updatedAt));
-    localStorage.setItem('tp_seen_'+syncProvider,'1');
-    setSyncStatus('connected');
-  }catch(e){ handleSyncError(e); }
-  syncBusy = false;
-}
+async function syncPull(){ return syncAll(false,false); }
+async function syncPush(){ return syncAll(syncDirty,false); }
 function handleSyncError(e){
   console.error('Sync failed', e);
   if(e && e.message==='auth'){
@@ -1748,6 +1832,8 @@ function handleSyncError(e){
   setSyncStatus('error');
 }
 function schedulePush(){
+  if(stamp(true)) persistAll();
+  syncDirty = true;
   touchLocal();
   if(!syncConnected) return;
   clearTimeout(pushTimer);

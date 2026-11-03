@@ -17,6 +17,13 @@ def rsub(pat, new, flags=0):
     s, n = re.subn(pat, lambda m: new, s, count=1, flags=flags)
     assert n == 1, 'pattern not found: ' + pat[:60]
 
+def rsub_tail(pat, new, flags=0):
+    global s
+    i = s.index('const Providers = {')
+    t, n = re.subn(pat, lambda m: new, s[i:], count=1, flags=flags)
+    assert n == 1, 'pattern not found: ' + pat[:60]
+    s = s[:i] + t
+
 # 1. keys: config.js -> localStorage override
 rsub(r"const GOOGLE_CLIENT_ID = '[^']*';\s*const DROPBOX_APP_KEY = '[^']*';", r'''const CFG = Object.assign({googleClientId:'',dropboxAppKey:'',onedriveClientId:''}, window.TP_CONFIG||{});
 const _ls = k => { try{ return localStorage.getItem(k)||''; }catch(e){ return ''; } };
@@ -83,7 +90,7 @@ function saveKey(){
 const Providers = {''')
 
 # 3. Dropbox (PKCE) + OneDrive providers
-rsub(r"  dropbox:\{.*?(?=\n  gist:\{)", r'''  dropbox:{
+rsub_tail(r"  dropbox:\{.*?(?=\n  gist:\{)", r'''  dropbox:{
     needsToken:false,
     help:'Create a free app at the <b>Dropbox App Console</b> (Scoped access → <b>App folder</b>, enable <code>files.content.read</code> + <code>files.content.write</code>), add this page\'s exact URL as a <b>Redirect URI</b>, paste the <b>App key</b> above and press Connect. Sign-in lasts (auto-refresh). Data goes to <code>Apps/&lt;your app&gt;/trade-pulse-pro-data.json</code>.',
     async connect(){ if(!DROPBOX_APP_KEY){ alert('Paste your Dropbox App key first.'); return; } await oauthStart('dropbox', {token_access_type:'offline'}); },
